@@ -1,0 +1,13 @@
+name = "stockai-2api"
+main = "worker.js"
+compatibility_date = "2026-10-29"
+
+# 保留在 Cloudflare Dashboard 里手动设置的变量，避免每次部署被清空
+keep_vars = true
+
+# 如需自定义密钥 / 上游地址，在 Dashboard → Settings → Variables 里添加：
+#   API_MASTER_KEY   = 你的密钥（默认 "1"，建议务必修改）
+#   UPSTREAM_API_URL = https://free.stockai.trade/api/chat
+
+[observability]
+enabled = true
