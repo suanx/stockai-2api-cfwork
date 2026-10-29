@@ -1,0 +1,4 @@
+# 复制为 .dev.vars 后填入你自己的值（本地 wrangler dev 用）
+# 生产环境请在 Cloudflare Dashboard → Settings → Variables and Secrets 里设置
+API_MASTER_KEY=1
+UPSTREAM_API_URL=https://free.stockai.trade/api/chat
