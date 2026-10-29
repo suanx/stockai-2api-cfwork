@@ -1,6 +1,13 @@
 # 🌌 StockAI-2API: Chimera Synthesis Edition
 ### (Cloudflare Worker 单文件版 · 代号：奇美拉)
 
+> **📦 本分支已补全部署配置（2026-10-30 更新）**
+> 新增 `wrangler.toml` / `package.json`，修复 Workers Builds 报
+> `Could not detect a directory containing static files` 的问题。
+> 用 Workers Builds 时：**Build command 留空**，**Deploy command 填 `npx wrangler deploy`**。
+> 部署后请在 Dashboard → Settings → Variables 里把 `API_MASTER_KEY` 从默认的 `1` 改成自己的密钥。
+
+
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Deploy to Cloudflare Workers](https://img.shields.io/badge/Deploy-Cloudflare%20Workers-orange)](https://deploy.workers.cloudflare.com/?url=https://github.com/lza6/stockai-2api-cfwork)
 [![Status: Stable v1.0.0](https://img.shields.io/badge/Status-Stable%20v1.0.0-brightgreen)](https://github.com/lza6/stockai-2api-cfwork)
