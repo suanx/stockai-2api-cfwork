@@ -1,0 +1,15 @@
+{
+  "name": "stockai-2api",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "StockAI -> OpenAI 协议转换网关 (Cloudflare Workers 单文件版)",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^4.156.0"
+  }
+}
