@@ -71,6 +71,7 @@ export default {
 
     // 2. 路由分发
     if (url.pathname === '/' || url.pathname === '') return handleUI(request, apiKey);
+    if (url.pathname === '/diag') return handleDiag(request, env);
     if (url.pathname.startsWith('/v1/')) return handleApi(request, apiKey, env);
 
     return createErrorResponse(`路径未找到: ${url.pathname}`, 404, 'not_found');
@@ -98,6 +99,46 @@ async function handleApi(request, apiKey, env) {
   }
 
   return createErrorResponse('Not Found', 404, 'not_found');
+}
+
+// --- 诊断端点: 直接打上游, 把真实状态原样吐出来 ---
+// 浏览器打开 https://你的域名/diag 就能看到上游到底返回了什么
+async function handleDiag(request, env) {
+  const upstreamUrl = (env && env.UPSTREAM_API_URL) || CONFIG.UPSTREAM_API_URL;
+  const payload = {
+    model: CONFIG.DEFAULT_MODEL,
+    webSearch: false,
+    id: generateRandomId(16),
+    messages: [{ parts: [{ type: 'text', text: 'hi' }], id: generateRandomId(16), role: 'user' }],
+    trigger: 'submit-message'
+  };
+
+  const t0 = Date.now();
+  let info;
+  try {
+    const res = await fetch(upstreamUrl, {
+      method: 'POST',
+      headers: CONFIG.HEADERS,
+      body: JSON.stringify(payload)
+    });
+    const raw = await res.text();
+    info = {
+      upstream_url: upstreamUrl,
+      http_status: res.status,
+      ok: res.ok,
+      elapsed_ms: Date.now() - t0,
+      response_headers: Object.fromEntries([...res.headers].slice(0, 12)),
+      body_preview: raw.slice(0, 800),
+      body_length: raw.length,
+      parsed_events: raw.split('\n').filter(l => l.trim()).slice(0, 8)
+    };
+  } catch (e) {
+    info = { upstream_url: upstreamUrl, fatal: String(e && e.message || e), elapsed_ms: Date.now() - t0 };
+  }
+
+  return new Response(JSON.stringify(info, null, 2), {
+    headers: corsHeaders({ 'Content-Type': 'application/json; charset=utf-8' })
+  });
 }
 
 // 处理模型列表
@@ -199,30 +240,32 @@ function handleStreamResponse(upstreamResponse, model, requestId, isWebUI) {
         buffer = lines.pop() || "";
 
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            const dataStr = line.slice(6).trim();
-            if (!dataStr || dataStr === '[DONE]') continue;
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+          // 兼容带 data: 前缀 (标准 SSE) 与不带前缀 (Vercel AI SDK: 0:"文字")
+          const dataStr = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed;
+          if (!dataStr || dataStr === '[DONE]') continue;
 
-            try {
-              const data = JSON.parse(dataStr);
-              
-              // StockAI 的 delta 在 data.delta 中，且类型为 text-delta
-              if (data.type === 'text-delta' && data.delta) {
-                const chunk = {
-                  id: requestId,
-                  object: "chat.completion.chunk",
-                  created: Math.floor(Date.now() / 1000),
-                  model: model,
-                  choices: [{ index: 0, delta: { content: data.delta }, finish_reason: null }]
-                };
-                await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
-              }
-              // 处理结束
-              else if (data.type === 'finish') {
-                 // Do nothing, wait for loop end or explicit stop
-              }
-            } catch (e) { }
+          // 裸字符串增量 (Vercel AI SDK: 0:"文字")
+          if (!dataStr.startsWith('{') && !dataStr.startsWith('[')) {
+            const bare = extractBareDelta(dataStr);
+            if (bare) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify(makeChunk(requestId, model, bare))}\n\n`));
+            }
+            continue;
           }
+
+          try {
+            const data = JSON.parse(dataStr);
+
+            // 结束类事件跳过
+            if (data.type === 'finish' || data.type === 'finish_step' || data.type === 'done') continue;
+
+            const text = extractText(data);
+            if (text) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify(makeChunk(requestId, model, text))}\n\n`));
+            }
+          } catch (e) { }
         }
       }
 
@@ -279,20 +322,29 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
       buffer = lines.pop() || "";
 
       for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          const dataStr = line.slice(6).trim();
-          if (!dataStr || dataStr === '[DONE]') continue;
-          try {
-            const data = JSON.parse(dataStr);
-            if (data.type === 'text-delta' && data.delta) {
-              fullText += data.delta;
-            }
-          } catch (e) {}
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        const dataStr = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed;
+        if (!dataStr || dataStr === '[DONE]') continue;
+        if (!dataStr.startsWith('{') && !dataStr.startsWith('[')) {
+          fullText += extractBareDelta(dataStr);
+          continue;
         }
+        try {
+          const data = JSON.parse(dataStr);
+          if (data.type === 'finish' || data.type === 'finish_step' || data.type === 'done') continue;
+          fullText += extractText(data);
+        } catch (e) {}
       }
     }
   } catch (e) {
     throw new Error(`Stream buffering failed: ${e.message}`);
+  }
+
+  // 上游 200 但没解析出任何文本 —— 明确提示, 避免客户端显示空白
+  let content = fullText;
+  if (!content) {
+    content = `[stockai-2api] 上游返回了空内容，未解析出任何文本。可能原因：上游协议已变更或需要登录。请在浏览器打开本站点 /diag 查看上游原始响应。`;
   }
 
   const response = {
@@ -302,7 +354,7 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
     model: model,
     choices: [{
       index: 0,
-      message: { role: "assistant", content: fullText },
+      message: { role: "assistant", content: content },
       finish_reason: "stop"
     }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
@@ -319,6 +371,45 @@ function verifyAuth(request, key) {
   if (!key || key === "1") return true; // 默认密钥不做校验
   const auth = request.headers.get('Authorization') || '';
   return auth === `Bearer ${key}`;
+}
+
+// 从上游事件对象里提取文本片段
+// 兼容多种常见格式: {type:'text-delta', delta} / {delta:{text}} / {text} / {content} / {value} / {choices:[{delta:{content}}]}
+function extractText(data) {
+  if (!data || typeof data !== 'object') return '';
+  const cands = [
+    data.delta, data.text, data.content, data.value, data.answer,
+    data.choices && data.choices[0] && data.choices[0].delta && data.choices[0].delta.content,
+    data.choices && data.choices[0] && data.choices[0].text,
+    data.message && data.message.content
+  ];
+  for (const c of cands) {
+    if (typeof c === 'string' && c) return c;
+    if (c && typeof c === 'object' && typeof c.text === 'string' && c.text) return c.text;
+  }
+  return '';
+}
+
+// Vercel AI SDK 的裸增量格式: 0:"文字" 或 0:"文" (JSON 转义串)
+function extractBareDelta(str) {
+  const m = str.match(/^\d+:(.*)$/s);
+  let s = m ? m[1] : str;
+  s = s.trim();
+  if (!s || s === '[DONE]') return '';
+  if (s.startsWith('"') && s.endsWith('"')) {
+    try { return JSON.parse(s); } catch (e) { return s.slice(1, -1); }
+  }
+  return '';
+}
+
+function makeChunk(requestId, model, text) {
+  return {
+    id: requestId,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model: model,
+    choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+  };
 }
 
 // 把 OpenAI 的 content 统一成纯文本
