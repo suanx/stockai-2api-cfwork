@@ -113,12 +113,16 @@ async function handleDiag(request, env) {
     trigger: 'submit-message'
   };
 
+  // 允许用环境变量注入浏览器 Cookie (上游风控时可绕过)
+  const headers = { ...CONFIG.HEADERS };
+  if (env && env.UPSTREAM_COOKIE) headers['cookie'] = env.UPSTREAM_COOKIE;
+
   const t0 = Date.now();
   let info;
   try {
     const res = await fetch(upstreamUrl, {
       method: 'POST',
-      headers: CONFIG.HEADERS,
+      headers: headers,
       body: JSON.stringify(payload)
     });
     const raw = await res.text();
@@ -130,7 +134,10 @@ async function handleDiag(request, env) {
       response_headers: Object.fromEntries([...res.headers].slice(0, 12)),
       body_preview: raw.slice(0, 800),
       body_length: raw.length,
-      parsed_events: raw.split('\n').filter(l => l.trim()).slice(0, 8)
+      parsed_events: raw.split('\n').filter(l => l.trim()).slice(0, 8),
+      extracted_text: collectUpstreamText(raw).slice(0, 300),
+      looks_like_blocked: looksBlocked(raw),
+      sent_cookie: !!(env && env.UPSTREAM_COOKIE)
     };
   } catch (e) {
     info = { upstream_url: upstreamUrl, fatal: String(e && e.message || e), elapsed_ms: Date.now() - t0 };
@@ -190,11 +197,13 @@ async function handleChatCompletions(request, requestId, env) {
       trigger: "submit-message"
     };
 
-    // 3. 发送请求 (上游地址支持用环境变量覆盖)
+    // 3. 发送请求 (上游地址 / Cookie 支持用环境变量覆盖)
     const upstreamUrl = (env && env.UPSTREAM_API_URL) || CONFIG.UPSTREAM_API_URL;
+    const upstreamHeaders = { ...CONFIG.HEADERS };
+    if (env && env.UPSTREAM_COOKIE) upstreamHeaders['cookie'] = env.UPSTREAM_COOKIE;
     const response = await fetch(upstreamUrl, {
       method: "POST",
-      headers: CONFIG.HEADERS,
+      headers: upstreamHeaders,
       body: JSON.stringify(payload)
     });
 
@@ -373,12 +382,40 @@ function verifyAuth(request, key) {
   return auth === `Bearer ${key}`;
 }
 
+// 把整段上游 SSE 里所有可能的文本片段拼起来
+function collectUpstreamText(raw) {
+  let out = '';
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    const s = t.startsWith('data:') ? t.slice(5).trim() : t;
+    if (!s || s === '[DONE]') continue;
+    if (!s.startsWith('{') && !s.startsWith('[')) { out += extractBareDelta(s); continue; }
+    try {
+      const o = JSON.parse(s);
+      if (o.type === 'finish' || o.type === 'finish_step' || o.type === 'done') continue;
+      out += extractText(o);
+    } catch (e) {}
+  }
+  return out;
+}
+
+// 判断上游是否返回了"广告/拦截话术"而不是真正的回答
+function looksBlocked(raw) {
+  const t = collectUpstreamText(raw);
+  if (!t) return t === '' && raw.length > 0 ? 'empty_body' : false;
+  const marks = ['Free AI for Everyone', 'Web AI助手', '免费提供', '全网最低价', '请前往'];
+  if (marks.some(m => t.includes(m))) return 'promo_or_gated';
+  return false;
+}
+
 // 从上游事件对象里提取文本片段
 // 兼容多种常见格式: {type:'text-delta', delta} / {delta:{text}} / {text} / {content} / {value} / {choices:[{delta:{content}}]}
 function extractText(data) {
   if (!data || typeof data !== 'object') return '';
   const cands = [
     data.delta, data.text, data.content, data.value, data.answer,
+    data.data, // AI SDK data 部件: {type:"data-text", data:"..."}
     data.choices && data.choices[0] && data.choices[0].delta && data.choices[0].delta.content,
     data.choices && data.choices[0] && data.choices[0].text,
     data.message && data.message.content
