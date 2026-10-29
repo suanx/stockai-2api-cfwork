@@ -62,39 +62,39 @@ const CONFIG = {
 // --- [第二部分: Worker 入口与路由] ---
 export default {
   async fetch(request, env, ctx) {
+    // 密钥优先读环境变量，未设置则回落到内置默认值
     const apiKey = env.API_MASTER_KEY || CONFIG.API_MASTER_KEY;
-    request.ctx = { apiKey };
-
     const url = new URL(request.url);
 
     // 1. CORS 预检
     if (request.method === 'OPTIONS') return handleCorsPreflight();
 
     // 2. 路由分发
-    if (url.pathname === '/') return handleUI(request);
-    if (url.pathname.startsWith('/v1/')) return handleApi(request);
-    
+    if (url.pathname === '/' || url.pathname === '') return handleUI(request, apiKey);
+    if (url.pathname.startsWith('/v1/')) return handleApi(request, apiKey, env);
+
     return createErrorResponse(`路径未找到: ${url.pathname}`, 404, 'not_found');
   }
 };
 
 // --- [第三部分: API 代理逻辑] ---
 
-async function handleApi(request) {
+async function handleApi(request, apiKey, env) {
   // 鉴权
-  if (!verifyAuth(request)) {
+  if (!verifyAuth(request, apiKey)) {
     return createErrorResponse('Unauthorized', 401, 'auth_error');
   }
 
   const url = new URL(request.url);
   const requestId = `req-${crypto.randomUUID()}`;
 
-  if (url.pathname === '/v1/models') {
+  // /v1/models 同时支持 GET 与 POST
+  if (url.pathname === '/v1/models' && (request.method === 'GET' || request.method === 'POST')) {
     return handleModelsRequest();
   }
 
   if (url.pathname === '/v1/chat/completions') {
-    return handleChatCompletions(request, requestId);
+    return handleChatCompletions(request, requestId, env);
   }
 
   return createErrorResponse('Not Found', 404, 'not_found');
@@ -117,7 +117,7 @@ function handleModelsRequest() {
 }
 
 // 处理聊天请求 (核心逻辑)
-async function handleChatCompletions(request, requestId) {
+async function handleChatCompletions(request, requestId, env) {
   try {
     const body = await request.json();
     const model = body.model || CONFIG.DEFAULT_MODEL;
@@ -127,11 +127,18 @@ async function handleChatCompletions(request, requestId) {
 
     // 1. 转换消息格式 (OpenAI -> StockAI)
     // StockAI 格式: { parts: [{type: "text", text: "..."}], role: "user", id: "..." }
-    const convertedMessages = messages.map(msg => ({
-      parts: [{ type: "text", text: msg.content }],
-      id: generateRandomId(16),
-      role: msg.role
-    }));
+    // 兼容 content 为字符串 / null / 多模态数组 三种情况
+    const convertedMessages = messages
+      .filter(msg => msg && msg.role)
+      .map(msg => ({
+        parts: [{ type: "text", text: normalizeContent(msg.content) }],
+        id: generateRandomId(16),
+        role: msg.role === 'system' ? 'user' : msg.role
+      }));
+
+    if (convertedMessages.length === 0) {
+      return createErrorResponse('messages 不能为空', 400, 'invalid_request');
+    }
 
     // 2. 构造上游 Payload
     const payload = {
@@ -142,8 +149,9 @@ async function handleChatCompletions(request, requestId) {
       trigger: "submit-message"
     };
 
-    // 3. 发送请求
-    const response = await fetch(CONFIG.UPSTREAM_API_URL, {
+    // 3. 发送请求 (上游地址支持用环境变量覆盖)
+    const upstreamUrl = (env && env.UPSTREAM_API_URL) || CONFIG.UPSTREAM_API_URL;
+    const response = await fetch(upstreamUrl, {
       method: "POST",
       headers: CONFIG.HEADERS,
       body: JSON.stringify(payload)
@@ -237,14 +245,19 @@ function handleStreamResponse(upstreamResponse, model, requestId, isWebUI) {
         model: model,
         choices: [{ index: 0, delta: { content: `\n\n[Error: ${e.message}]` }, finish_reason: "error" }]
       };
-      await writer.write(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`));
+      try { await writer.write(encoder.encode(`data: ${JSON.stringify(errChunk)}\n\n`)); } catch (w) { }
     } finally {
-      await writer.close();
+      try { await writer.close(); } catch (e) { /* 客户端已断开，忽略 */ }
     }
   })();
 
   return new Response(readable, {
-    headers: corsHeaders({ 'Content-Type': 'text/event-stream' })
+    headers: corsHeaders({
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no' // 防止中间层缓冲导致流式卡住
+    })
   });
 }
 
@@ -302,11 +315,23 @@ async function handleNonStreamResponse(upstreamResponse, model, requestId) {
 
 // --- 辅助函数 ---
 
-function verifyAuth(request) {
-  const auth = request.headers.get('Authorization');
-  const key = request.ctx.apiKey;
-  if (key === "1") return true;
+function verifyAuth(request, key) {
+  if (!key || key === "1") return true; // 默认密钥不做校验
+  const auth = request.headers.get('Authorization') || '';
   return auth === `Bearer ${key}`;
+}
+
+// 把 OpenAI 的 content 统一成纯文本
+// 支持: string / null / [{type:'text', text:'...'}] 多模态数组
+function normalizeContent(content) {
+  if (content === null || content === undefined) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map(p => (p && typeof p === 'object' && p.type === 'text' ? String(p.text ?? '') : String(p ?? '')))
+      .join('');
+  }
+  try { return JSON.stringify(content); } catch (e) { return String(content); }
 }
 
 function generateRandomId(length) {
@@ -336,10 +361,9 @@ function handleCorsPreflight() {
 }
 
 // --- [第四部分: 开发者驾驶舱 UI] ---
-function handleUI(request) {
+function handleUI(request, apiKey) {
   const origin = new URL(request.url).origin;
-  const apiKey = request.ctx.apiKey;
-  
+
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -531,5 +555,5 @@ function handleUI(request) {
 </body>
 </html>`;
 
-  return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  return new Response(html, { headers: corsHeaders({ 'Content-Type': 'text/html; charset=utf-8' }) });
 }
